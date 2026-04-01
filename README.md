@@ -162,11 +162,9 @@ aws bedrock-agent start-ingestion-job \
 The evaluation dataset is a JSONL file in `conversationTurns` format.
 
 ```jsonl
-{"conversationTurns": [{"prompt": {"content": [{"text": "What are the dimensions of SmartHub X1?"}]}}]}
-{"conversationTurns": [{"prompt": {"content": [{"text": "How long is the warranty period?"}]}}]}
+{"conversationTurns": [{"prompt": {"content": [{"text": "What are the dimensions of SmartHub X1?"}]}, "referenceResponses": [{"content": [{"text": "The dimensions of SmartHub X1 are 120mm x 120mm x 35mm."}]}]}]}
+{"conversationTurns": [{"prompt": {"content": [{"text": "How many devices can SmartHub X1 support at maximum?"}]}, "referenceResponses": [{"content": [{"text": "SmartHub X1 supports up to 100 devices."}]}]}]}
 ```
-
-> **Important**: Do not include `referenceResponse` for Knowledge Base evaluations.
 
 ---
 
