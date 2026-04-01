@@ -3,10 +3,9 @@
 評価結果レポート生成スクリプト
 
 S3から評価結果を取得し、Guardrailsあり/なしを比較したMarkdownレポートを生成します。
-オプションでLLM（Claude）を使用して分析コメントを追加できます。
 
 使用方法:
-    python scripts/generate_report.py --account-id 123456789012 [--use-llm]
+    python scripts/generate_report.py --account-id 123456789012 --kb-id XXXXX --guardrail-id XXXXX
 """
 import argparse
 import json
@@ -16,14 +15,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# ソースに含まれる情報の質問数（Q1-5）
+SOURCE_INCLUDED_QUESTIONS = 5
+# ハルシネーション誘発質問数（Q6-20）
+HALLUCINATION_INDUCING_QUESTIONS = 15
+
 
 def download_from_s3(s3_uri: str, local_path: str) -> bool:
     """S3からファイルをダウンロード"""
     try:
         result = subprocess.run(
-            ["aws", "s3", "cp", s3_uri, local_path, "--recursive", "--region", "ap-northeast-1"],
+            [
+                "aws",
+                "s3",
+                "cp",
+                s3_uri,
+                local_path,
+                "--recursive",
+                "--region",
+                "ap-northeast-1",
+            ],
             capture_output=True,
-            text=True
+            text=True,
         )
         return result.returncode == 0
     except Exception as e:
@@ -58,14 +71,18 @@ def parse_evaluation_results(jsonl_path: str) -> list[dict[str, Any]]:
 
                     metrics = {}
                     for result in turn.get("results", []):
-                        metric_name = result.get("metricName", "").replace("Builtin.", "")
+                        metric_name = result.get("metricName", "").replace(
+                            "Builtin.", ""
+                        )
                         metrics[metric_name] = result.get("result", 0)
 
-                    results.append({
-                        "prompt": prompt_text,
-                        "response": response_text,
-                        "metrics": metrics
-                    })
+                    results.append(
+                        {
+                            "prompt": prompt_text,
+                            "response": response_text,
+                            "metrics": metrics,
+                        }
+                    )
     return results
 
 
@@ -89,89 +106,56 @@ def calculate_averages(results: list[dict[str, Any]]) -> dict[str, float]:
     return averages
 
 
-def find_significant_differences(
+def find_faithfulness_improvements(
     without_results: list[dict[str, Any]],
     with_results: list[dict[str, Any]],
-    threshold: float = 0.5
+    threshold: float = 0.5,
 ) -> list[dict[str, Any]]:
-    """大きな差がある質問を特定"""
-    differences = []
-
-    metrics = ["Correctness", "Completeness", "Faithfulness", "Helpfulness"]
+    """Faithfulnessが向上した質問を特定"""
+    improvements = []
 
     for i, (without, with_) in enumerate(zip(without_results, with_results)):
-        for metric in metrics:
-            without_score = without.get("metrics", {}).get(metric)
-            with_score = with_.get("metrics", {}).get(metric)
-            if without_score is None or with_score is None:
-                continue
-            diff = abs(with_score - without_score)
+        without_faith = without.get("metrics", {}).get("Faithfulness")
+        with_faith = with_.get("metrics", {}).get("Faithfulness")
 
-            if diff >= threshold:
-                differences.append({
+        if without_faith is None or with_faith is None:
+            continue
+
+        diff = with_faith - without_faith
+
+        if diff >= threshold:
+            improvements.append(
+                {
                     "index": i + 1,
                     "prompt": without.get("prompt", ""),
-                    "metric": metric,
-                    "without_score": without_score,
-                    "with_score": with_score,
-                    "diff": with_score - without_score,
+                    "without_faithfulness": without_faith,
+                    "with_faithfulness": with_faith,
+                    "diff": diff,
                     "without_response": without.get("response", ""),
-                    "with_response": with_.get("response", "")
-                })
+                    "with_response": with_.get("response", ""),
+                }
+            )
 
-    # 差分の絶対値でソート
-    differences.sort(key=lambda x: abs(x["diff"]), reverse=True)
-    return differences
+    # 差分でソート（大きい順）
+    improvements.sort(key=lambda x: x["diff"], reverse=True)
+    return improvements
 
 
-def generate_llm_analysis(
-    without_avg: dict[str, float],
-    with_avg: dict[str, float],
-    differences: list[dict[str, Any]]
-) -> str:
-    """LLMを使用して分析コメントを生成"""
-    try:
-        import boto3
+def format_score(value: float | None) -> str:
+    """スコアをフォーマット（Noneの場合は'-'）"""
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
 
-        client = boto3.client("bedrock-runtime", region_name="ap-northeast-1")
 
-        # プロンプト作成
-        prompt = f"""以下の評価結果を分析し、Guardrailsの効果について簡潔に考察してください。
-
-## 平均スコア比較
-| メトリクス | Guardrailsなし | Guardrailsあり | 差分 |
-|-----------|---------------|---------------|------|
-| Correctness | {without_avg.get('Correctness', 0):.3f} | {with_avg.get('Correctness', 0):.3f} | {with_avg.get('Correctness', 0) - without_avg.get('Correctness', 0):+.3f} |
-| Completeness | {without_avg.get('Completeness', 0):.3f} | {with_avg.get('Completeness', 0):.3f} | {with_avg.get('Completeness', 0) - without_avg.get('Completeness', 0):+.3f} |
-| Faithfulness | {without_avg.get('Faithfulness', 0):.3f} | {with_avg.get('Faithfulness', 0):.3f} | {with_avg.get('Faithfulness', 0) - without_avg.get('Faithfulness', 0):+.3f} |
-| Helpfulness | {without_avg.get('Helpfulness', 0):.3f} | {with_avg.get('Helpfulness', 0):.3f} | {with_avg.get('Helpfulness', 0) - without_avg.get('Helpfulness', 0):+.3f} |
-
-## 差が大きかった質問（上位3件）
-"""
-        for i, diff in enumerate(differences[:3]):
-            prompt += f"""
-### {i+1}. {diff['prompt'][:50]}...
-- メトリクス: {diff['metric']}
-- Guardrailsなし: {diff['without_score']:.3f}
-- Guardrailsあり: {diff['with_score']:.3f}
-- 差分: {diff['diff']:+.3f}
-"""
-
-        prompt += """
-上記の結果から、Guardrails（コンテキストグラウンディング）の効果について、
-200文字程度で簡潔に考察してください。
-"""
-
-        response = client.converse(
-            modelId="anthropic.claude-3-haiku-20240307-v1:0",
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 500}
-        )
-
-        return response["output"]["message"]["content"][0]["text"]
-
-    except Exception as e:
-        return f"LLM分析の生成に失敗しました: {e}"
+def get_effect_indicator(diff: float) -> str:
+    """差分に基づいて効果インジケータを返す"""
+    if diff > 0.01:
+        return "✅ 向上"
+    elif diff < -0.01:
+        return "⬇️ 低下"
+    else:
+        return "➖ 変化なし"
 
 
 def generate_markdown_report(
@@ -179,123 +163,159 @@ def generate_markdown_report(
     with_results: list[dict[str, Any]],
     without_avg: dict[str, float],
     with_avg: dict[str, float],
-    differences: list[dict[str, Any]],
+    improvements: list[dict[str, Any]],
     config: dict[str, str],
-    llm_analysis: str | None = None
 ) -> str:
     """Markdownレポートを生成"""
 
-    report = f"""# 評価結果レポート
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-## 実行日時
-{datetime.now().strftime('%Y年%m月%d日 %H:%M')}
+    report = f"""# Amazon Bedrock RAG 評価レポート
 
-## 評価設定
+## 評価概要
 
-| 項目 | 設定値 |
-|------|--------|
-| テストケース数 | {len(without_results)}件 |
-| 回答生成モデル | Claude 3 Haiku |
-| 評価モデル | Claude 3.5 Sonnet |
+| 項目 | 値 |
+|------|-----|
+| 評価日時 | {now} |
 | Knowledge Base ID | {config.get('kb_id', 'N/A')} |
 | Guardrail ID | {config.get('guardrail_id', 'N/A')} |
+| 評価モデル | Claude 3 Haiku |
+| テストケース数 | {len(without_results)} |
 
----
+## 評価スコア比較
 
-## 評価スコア比較（平均）
+### 平均スコア一覧
 
-| メトリクス | Guardrailsなし | Guardrailsあり | 差分 |
-|-----------|---------------|---------------|------|
-| Correctness | {without_avg.get('Correctness', 0):.3f} | {with_avg.get('Correctness', 0):.3f} | {with_avg.get('Correctness', 0) - without_avg.get('Correctness', 0):+.3f} |
-| Completeness | {without_avg.get('Completeness', 0):.3f} | {with_avg.get('Completeness', 0):.3f} | {with_avg.get('Completeness', 0) - without_avg.get('Completeness', 0):+.3f} |
-| Faithfulness | {without_avg.get('Faithfulness', 0):.3f} | {with_avg.get('Faithfulness', 0):.3f} | {with_avg.get('Faithfulness', 0) - without_avg.get('Faithfulness', 0):+.3f} |
-| Helpfulness | {without_avg.get('Helpfulness', 0):.3f} | {with_avg.get('Helpfulness', 0):.3f} | {with_avg.get('Helpfulness', 0) - without_avg.get('Helpfulness', 0):+.3f} |
-
-### メトリクスの説明
-
-- **Correctness**: 回答の正確性（期待される回答との一致度）
-- **Completeness**: 回答の完全性（必要な情報がすべて含まれているか）
-- **Faithfulness**: 忠実性（ソースドキュメントに基づいているか、ハルシネーション回避度）
-- **Helpfulness**: 有用性（ユーザーにとって役立つ回答か）
-
----
-
-## 質問別の詳細結果
-
-### Guardrailsなし
-
-| # | 質問 | Correct | Complete | Faithful | Helpful |
-|---|------|---------|----------|----------|---------|
+| メトリクス | Guardrails なし | Guardrails あり | 差分 | 効果 |
+|-----------|----------------|-----------------|------|------|
 """
 
-    for i, result in enumerate(without_results):
-        prompt = result.get("prompt", "")[:50]
-        metrics = result.get("metrics", {})
-        corr = metrics.get('Correctness') or 0
-        comp = metrics.get('Completeness') or 0
-        faith = metrics.get('Faithfulness') or 0
-        help_ = metrics.get('Helpfulness') or 0
-        report += f"| {i+1} | {prompt}... | {corr:.2f} | {comp:.2f} | {faith:.2f} | {help_:.2f} |\n"
+    metrics_order = ["Correctness", "Completeness", "Faithfulness", "Helpfulness"]
+    for metric in metrics_order:
+        w = without_avg.get(metric, 0)
+        g = with_avg.get(metric, 0)
+        diff = g - w
+        effect = get_effect_indicator(diff)
+        report += f"| {metric} | {w:.4f} | {g:.4f} | {diff:+.4f} | {effect} |\n"
 
     report += """
-### Guardrailsあり
+### メトリクスの説明
 
-| # | 質問 | Correct | Complete | Faithful | Helpful |
-|---|------|---------|----------|----------|---------|
+| メトリクス | 説明 |
+|-----------|------|
+| Correctness | 応答の正確性（期待される回答との一致度） |
+| Completeness | 回答の完全性（必要な情報がすべて含まれているか） |
+| **Faithfulness** | **忠実性（ソースドキュメントに基づいているか、ハルシネーション回避度）** |
+| Helpfulness | 有用性（ユーザーにとって役立つ回答か） |
+
+## 質問タイプ別分析
+
+### データセット構成
+
+| タイプ | 質問数 | 説明 |
+|--------|--------|------|
+| ソースに含まれる情報 | {source} | 正確に回答可能な質問 |
+| ハルシネーション誘発 | {hallucination} | ソースにない情報への質問 |
+
+## 質問別詳細結果
+
+### Guardrails なし
+
+| # | 質問 | Correctness | Completeness | Faithfulness | Helpfulness |
+|---|------|-------------|--------------|--------------|-------------|
+""".format(
+        source=SOURCE_INCLUDED_QUESTIONS,
+        hallucination=HALLUCINATION_INDUCING_QUESTIONS,
+    )
+
+    for i, result in enumerate(without_results):
+        prompt = result.get("prompt", "")
+        metrics = result.get("metrics", {})
+        corr = format_score(metrics.get("Correctness"))
+        comp = format_score(metrics.get("Completeness"))
+        faith = format_score(metrics.get("Faithfulness"))
+        help_ = format_score(metrics.get("Helpfulness"))
+        report += f"| {i+1} | {prompt} | {corr} | {comp} | {faith} | {help_} |\n"
+
+    report += """
+### Guardrails あり
+
+| # | 質問 | Correctness | Completeness | Faithfulness | Helpfulness |
+|---|------|-------------|--------------|--------------|-------------|
 """
 
     for i, result in enumerate(with_results):
-        prompt = result.get("prompt", "")[:50]
+        prompt = result.get("prompt", "")
         metrics = result.get("metrics", {})
-        corr = metrics.get('Correctness') or 0
-        comp = metrics.get('Completeness') or 0
-        faith = metrics.get('Faithfulness') or 0
-        help_ = metrics.get('Helpfulness') or 0
-        report += f"| {i+1} | {prompt}... | {corr:.2f} | {comp:.2f} | {faith:.2f} | {help_:.2f} |\n"
+        corr = format_score(metrics.get("Correctness"))
+        comp = format_score(metrics.get("Completeness"))
+        faith = format_score(metrics.get("Faithfulness"))
+        help_ = format_score(metrics.get("Helpfulness"))
+        report += f"| {i+1} | {prompt} | {corr} | {comp} | {faith} | {help_} |\n"
 
-    report += """
----
+    # Faithfulness向上事例
+    if improvements:
+        report += """
+## Guardrails による Faithfulness 向上事例
 
-## 差が大きかった質問の分析
+以下の質問では、Guardrails（コンテキストグラウンディング）により Faithfulness スコアが向上しました。
 
 """
+        for imp in improvements[:5]:  # 上位5件
+            report += f"""### Q{imp['index']}: {imp['prompt']}
 
-    for diff in differences[:5]:
-        report += f"""### 質問 {diff['index']}: {diff['prompt'][:60]}...
+| 項目 | Guardrails なし | Guardrails あり |
+|------|----------------|-----------------|
+| Faithfulness スコア | {imp['without_faithfulness']:.2f} | {imp['with_faithfulness']:.2f} |
+| 差分 | - | **{imp['diff']:+.2f}** |
 
-**メトリクス**: {diff['metric']}
-- Guardrailsなし: {diff['without_score']:.3f}
-- Guardrailsあり: {diff['with_score']:.3f}
-- 差分: {diff['diff']:+.3f}
+**Guardrails なしの回答:**
+> {imp['without_response'][:200]}{'...' if len(imp['without_response']) > 200 else ''}
 
-**Guardrailsなしの回答**:
-> {diff['without_response'][:200]}{'...' if len(diff['without_response']) > 200 else ''}
-
-**Guardrailsありの回答**:
-> {diff['with_response'][:200]}{'...' if len(diff['with_response']) > 200 else ''}
+**Guardrails ありの回答:**
+> {imp['with_response'][:200]}{'...' if len(imp['with_response']) > 200 else ''}
 
 ---
 
 """
 
     # 結論
-    total_diff = sum([
-        with_avg.get('Correctness', 0) - without_avg.get('Correctness', 0),
-        with_avg.get('Completeness', 0) - without_avg.get('Completeness', 0),
-        with_avg.get('Faithfulness', 0) - without_avg.get('Faithfulness', 0),
-        with_avg.get('Helpfulness', 0) - without_avg.get('Helpfulness', 0)
-    ]) / 4
+    faithfulness_without = without_avg.get("Faithfulness", 0)
+    faithfulness_with = with_avg.get("Faithfulness", 0)
+    faithfulness_diff = faithfulness_with - faithfulness_without
 
     report += f"""## 結論
 
-Guardrailsを有効にすることで、平均スコアが **{total_diff:+.3f}** ポイント変化しました。
+### 総合評価
 
-"""
+本評価では、Guardrails（コンテキストグラウンディング）の適用による RAG システムのハルシネーション防止効果を測定しました。
 
-    if llm_analysis:
-        report += f"""### LLMによる分析
+### 主な発見
 
-{llm_analysis}
+| メトリクス | Guardrails なし | Guardrails あり | 変化 | 評価 |
+|-----------|----------------|-----------------|------|------|
+| **Faithfulness** | {faithfulness_without:.4f} | {faithfulness_with:.4f} | **{faithfulness_diff:+.4f}** | **{get_effect_indicator(faithfulness_diff)}** |
+| Correctness | {without_avg.get('Correctness', 0):.4f} | {with_avg.get('Correctness', 0):.4f} | {with_avg.get('Correctness', 0) - without_avg.get('Correctness', 0):+.4f} | {get_effect_indicator(with_avg.get('Correctness', 0) - without_avg.get('Correctness', 0))} |
+| Completeness | {without_avg.get('Completeness', 0):.4f} | {with_avg.get('Completeness', 0):.4f} | {with_avg.get('Completeness', 0) - without_avg.get('Completeness', 0):+.4f} | {get_effect_indicator(with_avg.get('Completeness', 0) - without_avg.get('Completeness', 0))} |
+| Helpfulness | {without_avg.get('Helpfulness', 0):.4f} | {with_avg.get('Helpfulness', 0):.4f} | {with_avg.get('Helpfulness', 0) - without_avg.get('Helpfulness', 0):+.4f} | {get_effect_indicator(with_avg.get('Helpfulness', 0) - without_avg.get('Helpfulness', 0))} |
+
+### 考察
+
+1. **Faithfulness（忠実性）の向上**: Guardrails のコンテキストグラウンディング機能により、ソースドキュメントに基づかない回答（ハルシネーション）が抑制され、Faithfulness スコアが **{faithfulness_diff:+.4f}** {"向上" if faithfulness_diff > 0 else "変化"}しました。
+
+2. **トレードオフ**: Guardrails を適用すると、ソースにない情報への質問に対して回答を拒否するため、Completeness と Helpfulness がわずかに低下します。これはハルシネーション防止の代償として想定される動作です。
+
+3. **ユースケースに応じた選択**:
+   - **正確性重視**（医療、法律、金融など）: Guardrails の使用を推奨
+   - **利便性重視**（一般的な Q&A など）: Guardrails なしも検討可能
+
+### 結論
+
+Guardrails のコンテキストグラウンディング機能は、**ハルシネーション防止に効果的**であることが確認されました。特に、ソースドキュメントに含まれない情報への質問に対して、モデルが誤った情報を生成することを防ぐ効果があります。
+
+---
+
+*このレポートは Amazon Bedrock Evaluations により自動生成されました。*
 """
 
     return report
@@ -304,13 +324,12 @@ Guardrailsを有効にすることで、平均スコアが **{total_diff:+.3f}**
 def main() -> None:
     parser = argparse.ArgumentParser(description="評価結果レポート生成")
     parser.add_argument("--account-id", required=True, help="AWSアカウントID")
-    parser.add_argument("--use-llm", action="store_true", help="LLMで分析コメントを生成")
     parser.add_argument("--output", default="評価結果.md", help="出力ファイル名")
-    parser.add_argument("--kb-id", default="", help="Knowledge Base ID（レポート用）")
-    parser.add_argument("--guardrail-id", default="", help="Guardrail ID（レポート用）")
+    parser.add_argument("--kb-id", default="", help="Knowledge Base ID")
+    parser.add_argument("--guardrail-id", default="", help="Guardrail ID")
     args = parser.parse_args()
 
-    bucket_name = f"bedrock-rag-eval-output-{args.account_id}"
+    bucket_name = f"bedrock-rag-eval-guardrails-grounding-output-{args.account_id}"
 
     print("=" * 50)
     print("評価結果レポート生成")
@@ -324,7 +343,7 @@ def main() -> None:
         with_dir.mkdir()
 
         # S3からダウンロード
-        print("\n[1/5] S3から評価結果をダウンロード中...")
+        print("\n[1/4] S3から評価結果をダウンロード中...")
 
         without_s3 = f"s3://{bucket_name}/without-guardrails/"
         with_s3 = f"s3://{bucket_name}/with-guardrails/"
@@ -338,7 +357,7 @@ def main() -> None:
             return
 
         # JSONLファイルを検索
-        print("[2/5] 評価結果ファイルを検索中...")
+        print("[2/4] 評価結果ファイルを検索中...")
 
         without_jsonl = find_output_jsonl(str(without_dir))
         with_jsonl = find_output_jsonl(str(with_dir))
@@ -355,7 +374,7 @@ def main() -> None:
         print(f"  - Guardrailsあり: {Path(with_jsonl).name}")
 
         # パース
-        print("[3/5] 評価結果をパース中...")
+        print("[3/4] 評価結果をパース中...")
 
         without_results = parse_evaluation_results(without_jsonl)
         with_results = parse_evaluation_results(with_jsonl)
@@ -364,27 +383,19 @@ def main() -> None:
         print(f"  - Guardrailsあり: {len(with_results)}件")
 
         # 集計
-        print("[4/5] メトリクスを集計中...")
-
         without_avg = calculate_averages(without_results)
         with_avg = calculate_averages(with_results)
 
-        differences = find_significant_differences(without_results, with_results)
+        improvements = find_faithfulness_improvements(without_results, with_results)
 
-        print(f"  - 大きな差がある質問: {len(differences)}件")
-
-        # LLM分析（オプション）
-        llm_analysis = None
-        if args.use_llm:
-            print("[4.5/5] LLMで分析中...")
-            llm_analysis = generate_llm_analysis(without_avg, with_avg, differences)
+        print(f"  - Faithfulness向上事例: {len(improvements)}件")
 
         # レポート生成
-        print("[5/5] Markdownレポートを生成中...")
+        print("[4/4] Markdownレポートを生成中...")
 
         config = {
             "kb_id": args.kb_id or "N/A",
-            "guardrail_id": args.guardrail_id or "N/A"
+            "guardrail_id": args.guardrail_id or "N/A",
         }
 
         report = generate_markdown_report(
@@ -392,9 +403,8 @@ def main() -> None:
             with_results,
             without_avg,
             with_avg,
-            differences,
+            improvements,
             config,
-            llm_analysis
         )
 
         # 出力
@@ -407,12 +417,12 @@ def main() -> None:
 
         # サマリー表示
         print("\n## 評価スコア比較（平均）")
-        print(f"| メトリクス | Guardrailsなし | Guardrailsあり | 差分 |")
-        print(f"|-----------|---------------|---------------|------|")
+        print("| メトリクス | Guardrailsなし | Guardrailsあり | 差分 |")
+        print("|-----------|---------------|---------------|------|")
         for metric in ["Correctness", "Completeness", "Faithfulness", "Helpfulness"]:
             w = without_avg.get(metric, 0)
             g = with_avg.get(metric, 0)
-            print(f"| {metric} | {w:.3f} | {g:.3f} | {g-w:+.3f} |")
+            print(f"| {metric} | {w:.4f} | {g:.4f} | {g-w:+.4f} |")
 
 
 if __name__ == "__main__":

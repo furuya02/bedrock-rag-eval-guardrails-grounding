@@ -1,6 +1,6 @@
 # Amazon Bedrock RAG 評価フレームワーク - Guardrails コンテキストグラウンディング評価
 
-Amazon Bedrock Evaluations を使用して、Knowledge Bases への Guardrails（コンテキストグラウンディング）適用による**ハルシネーション防止の有効性**を評価するためのフレームワークです。
+Amazon Bedrock Evaluations を使用して、Knowledge Bases への Guardrails（コンテキストグラウンディング）適用による**ハルシネーション防止の有効性**を評価した作業の記録です
 
 ## 機能
 
@@ -162,11 +162,9 @@ aws bedrock-agent start-ingestion-job \
 評価データセットは `conversationTurns` 形式の JSONL ファイルです。
 
 ```jsonl
-{"conversationTurns": [{"prompt": {"content": [{"text": "SmartHub X1の寸法を教えてください"}]}}]}
-{"conversationTurns": [{"prompt": {"content": [{"text": "保証期間はどのくらいですか？"}]}}]}
+{"conversationTurns": [{"prompt": {"content": [{"text": "SmartHub X1の寸法を教えてください"}]}, "referenceResponses": [{"content": [{"text": "SmartHub X1の寸法は120mm x 120mm x 35mmです。"}]}]}]}
+{"conversationTurns": [{"prompt": {"content": [{"text": "SmartHub X1は最大何台のデバイスに対応していますか？"}]}, "referenceResponses": [{"content": [{"text": "SmartHub X1は最大100台のデバイスに対応しています。"}]}]}]}
 ```
-
-> **重要**: Knowledge Base 評価では `referenceResponse` は含めません。
 
 ---
 
